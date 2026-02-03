@@ -6,11 +6,10 @@ const admin = require('firebase-admin');
 const { Readable } = require('stream');
 
 const app = express();
-app.use(cors()); // Разрешаем доступ с сайта
+app.use(cors());
 app.use(express.json());
 
-// 1. Настройка Firebase
-// Получаем настройки из переменных Render
+// --- 1. Настройки (Firebase & Cloudinary) ---
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
 admin.initializeApp({
@@ -21,21 +20,20 @@ admin.initializeApp({
 const db = admin.database();
 const ref = db.ref("materials");
 
-// 2. Настройка Cloudinary
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_NAME,
   api_key: process.env.CLOUDINARY_KEY,
   api_secret: process.env.CLOUDINARY_SECRET
 });
 
-// Настройка Multer (принимаем файлы в память)
+// Настройка загрузки (лимит 50МБ для защиты памяти)
 const storage = multer.memoryStorage();
 const upload = multer({ 
     storage: storage,
     limits: { fileSize: 50 * 1024 * 1024 } 
 });
 
-// --- ПРОВЕРКА ПАРОЛЯ АДМИНА ---
+// --- 2. Авторизация ---
 const ADMIN_LOGIN = "Gaponenko";
 const ADMIN_PASS = "GaponenkoJ";
 
@@ -53,7 +51,12 @@ const checkAuth = (req, res, next) => {
 
 // --- API МАРШРУТЫ ---
 
-// 1. Получить все материалы (Доступно всем)
+// 0. Пинг (чтобы сервер не спал)
+app.get('/ping', (req, res) => {
+    res.send('Pong! I am awake.');
+});
+
+// 1. Получить все материалы
 app.get('/api/materials', async (req, res) => {
   try {
     const snapshot = await ref.once('value');
@@ -64,7 +67,7 @@ app.get('/api/materials', async (req, res) => {
   }
 });
 
-// 2. Загрузить новый материал (Файл или Текст)
+// 2. Загрузить (Один файл за раз, очередь на фронтенде)
 app.post('/api/upload', checkAuth, upload.single('file'), async (req, res) => {
   try {
     const { title, category, textContent, isTextPost } = req.body;
@@ -77,17 +80,16 @@ app.post('/api/upload', checkAuth, upload.single('file'), async (req, res) => {
       createdAt: Date.now()
     };
 
-    // ВАРИАНТ А: Текстовый пост
     if (isTextPost === 'true') {
+        // Текстовый пост
         fileData.type = 'text';
         fileData.content = textContent;
         fileData.url = null;
-    } 
-    // ВАРИАНТ Б: Загрузка файла
-    else {
+        fileData.public_id = null; // Нет файла в облаке
+    } else {
+        // Файл
         if (!req.file) return res.status(400).send('Нет файла');
 
-        // Отправка в Cloudinary через поток
         const streamUpload = (fileBuffer) => {
             return new Promise((resolve, reject) => {
                 const stream = cloudinary.uploader.upload_stream(
@@ -103,27 +105,72 @@ app.post('/api/upload', checkAuth, upload.single('file'), async (req, res) => {
 
         const result = await streamUpload(req.file.buffer);
         
-        fileData.type = result.format || 'file'; // pdf, jpg, docx...
+        fileData.type = result.format || 'file';
         fileData.url = result.secure_url;
         fileData.content = null;
+        fileData.public_id = result.public_id; // ВАЖНО: ID для удаления
     }
 
-    // Сохранение записи в базу
     await newFileRef.set(fileData);
-    
     res.json(fileData);
 
   } catch (error) {
     console.error("Upload error:", error);
-    res.status(500).json({ error: "Ошибка загрузки на сервере" });
+    res.status(500).json({ error: "Ошибка сервера" });
   }
 });
 
-// 3. Удалить материал
+// 3. Редактирование (Название, Категория, Текст)
+app.put('/api/edit/:id', checkAuth, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { title, category, content } = req.body;
+
+        const itemRef = ref.child(id);
+        const snapshot = await itemRef.once('value');
+        if (!snapshot.exists()) return res.status(404).json({ error: "Не найдено" });
+
+        const updates = { title, category };
+        if (content) updates.content = content;
+
+        await itemRef.update(updates);
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// 4. Удаление (База + Cloudinary)
 app.delete('/api/delete/:id', checkAuth, async (req, res) => {
     try {
         const fileId = req.params.id;
-        await ref.child(fileId).remove();
+        const itemRef = ref.child(fileId);
+        
+        // Сначала получаем данные о файле, чтобы узнать public_id
+        const snapshot = await itemRef.once('value');
+        const item = snapshot.val();
+
+        if (item && item.public_id) {
+            // Удаляем из Cloudinary
+            try {
+                // Определяем тип ресурса (image, video или raw для pdf/doc)
+                let resourceType = 'image';
+                if (item.type === 'pdf' || item.type.includes('doc') || item.type.includes('ppt')) {
+                    resourceType = 'raw'; 
+                } else if (item.type === 'mp4' || item.type === 'avi') {
+                    resourceType = 'video';
+                }
+                
+                await cloudinary.uploader.destroy(item.public_id, { resource_type: resourceType });
+                console.log(`Deleted from Cloud: ${item.public_id}`);
+            } catch (cloudError) {
+                console.error("Cloudinary delete error:", cloudError);
+                // Не прерываем, всё равно удалим из базы
+            }
+        }
+
+        // Удаляем из базы
+        await itemRef.remove();
         res.json({ success: true });
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -134,5 +181,4 @@ app.delete('/api/delete/:id', checkAuth, async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-
 });
