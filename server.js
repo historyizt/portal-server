@@ -30,7 +30,10 @@ cloudinary.config({
 
 // Настройка Multer (принимаем файлы в память)
 const storage = multer.memoryStorage();
-const upload = multer({ storage: storage });
+const upload = multer({ 
+    storage: storage,
+    limits: { fileSize: 50 * 1024 * 1024 } 
+});
 
 // --- ПРОВЕРКА ПАРОЛЯ АДМИНА ---
 const ADMIN_LOGIN = "Gaponenko";
@@ -131,4 +134,5 @@ app.delete('/api/delete/:id', checkAuth, async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+
 });
